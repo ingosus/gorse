@@ -461,6 +461,7 @@ func (w *Worker) Serve() {
 		w.peers = []string{w.workerName}
 		w.me = w.workerName
 	} else {
+		w.Sync2()
 		go w.Pull()
 		go w.ServeHTTP()
 	}
