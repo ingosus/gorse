@@ -682,6 +682,65 @@ func (m *mockMaster) Stop() {
 	m.cacheStore.Close()
 }
 
+func TestWorker_SyncRecommend(t *testing.T) {
+	store, err := miniredis.Run()
+	assert.NoError(t, err)
+
+	cfg := config.GetDefaultConfig()
+	storeAddr := "redis://" + store.Addr()
+	cfg.Database.DataStore = storeAddr
+	cfg.Database.CacheStore = storeAddr
+
+	buf := bytes.NewBuffer(nil)
+
+	master := &mockMaster{
+		addr: make(chan string),
+		meta: &protocol.Meta{
+			Config:              marshal(t, cfg),
+			ClickModelVersion:   1,
+			RankingModelVersion: 2,
+		},
+		cacheStore:   store,
+		dataStore:    store,
+		userIndex:    buf.Bytes(),
+		clickModel:   buf.Bytes(),
+		rankingModel: buf.Bytes(),
+	}
+
+	go master.Start(t)
+
+	address := <-master.addr
+	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	assert.NoError(t, err)
+
+	serv := &Worker{
+		Settings:     config.NewSettings(),
+		testMode:     true,
+		masterClient: protocol.NewMasterClient(conn),
+		syncedChan:   parallel.NewConditionChannel(),
+		ticker:       time.NewTicker(time.Minute),
+	}
+	serv.Sync()
+
+	done := make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				serv.Sync()
+			}
+		}
+	}()
+
+	serv.Recommend([]data.User{{UserId: "1"}})
+
+	done <- struct{}{}
+	master.Stop()
+}
+
 func TestWorker_Sync(t *testing.T) {
 	master := newMockMaster(t)
 	go master.Start(t)
