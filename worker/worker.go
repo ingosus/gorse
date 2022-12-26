@@ -218,6 +218,89 @@ func (w *Worker) Sync() {
 	}
 }
 
+func (w *Worker) Sync2() {
+	defer base.CheckPanic()
+
+	log.Logger().Info("start meta sync", zap.Duration("meta_timeout", w.Config.Master.MetaTimeout))
+	var meta *protocol.Meta
+	var err error
+	if meta, err = w.masterClient.GetMeta(context.Background(),
+		&protocol.NodeInfo{
+			NodeType:      protocol.NodeType_WorkerNode,
+			NodeName:      w.workerName,
+			HttpPort:      int64(w.httpPort),
+			BinaryVersion: version.Version,
+		}); err != nil {
+		log.Logger().Error("failed to get meta", zap.Error(err))
+
+		return
+	}
+
+	// load master config
+	w.Config.Recommend.Offline.Lock()
+	err = json.Unmarshal([]byte(meta.Config), &w.Config)
+	if err != nil {
+		w.Config.Recommend.Offline.UnLock()
+		log.Logger().Error("failed to parse master config", zap.Error(err))
+
+		return
+	}
+	w.Config.Recommend.Offline.UnLock()
+
+	// reset ticker
+	if w.tickDuration != w.Config.Recommend.Offline.CheckRecommendPeriod {
+		w.tickDuration = w.Config.Recommend.Offline.CheckRecommendPeriod
+		w.ticker.Reset(w.Config.Recommend.Offline.CheckRecommendPeriod)
+	}
+
+	// connect to data store
+	if w.dataPath != w.Config.Database.DataStore || w.dataPrefix != w.Config.Database.DataTablePrefix {
+		log.Logger().Info("connect data store",
+			zap.String("database", log.RedactDBURL(w.Config.Database.DataStore)))
+		if w.DataClient, err = data.Open(w.Config.Database.DataStore, w.Config.Database.DataTablePrefix); err != nil {
+			log.Logger().Error("failed to connect data store", zap.Error(err))
+
+			return
+		}
+		w.dataPath = w.Config.Database.DataStore
+		w.dataPrefix = w.Config.Database.DataTablePrefix
+	}
+
+	// connect to cache store
+	if w.cachePath != w.Config.Database.CacheStore || w.cachePrefix != w.Config.Database.CacheTablePrefix {
+		log.Logger().Info("connect cache store",
+			zap.String("database", log.RedactDBURL(w.Config.Database.CacheStore)))
+		if w.CacheClient, err = cache.Open(w.Config.Database.CacheStore, w.Config.Database.CacheTablePrefix); err != nil {
+			log.Logger().Error("failed to connect cache store", zap.Error(err))
+
+			return
+		}
+		w.cachePath = w.Config.Database.CacheStore
+		w.cachePrefix = w.Config.Database.CacheTablePrefix
+	}
+
+	// check ranking model version
+	w.latestRankingModelVersion = meta.RankingModelVersion
+	if w.latestRankingModelVersion != w.RankingModelVersion {
+		log.Logger().Info("new ranking model found",
+			zap.String("old_version", encoding.Hex(w.RankingModelVersion)),
+			zap.String("new_version", encoding.Hex(w.latestRankingModelVersion)))
+		w.syncedChan.Signal()
+	}
+
+	// check click model version
+	w.latestClickModelVersion = meta.ClickModelVersion
+	if w.latestClickModelVersion != w.ClickModelVersion {
+		log.Logger().Info("new click model found",
+			zap.String("old_version", encoding.Hex(w.ClickModelVersion)),
+			zap.String("new_version", encoding.Hex(w.latestClickModelVersion)))
+		w.syncedChan.Signal()
+	}
+
+	w.peers = meta.Workers
+	w.me = meta.Me
+}
+
 // Pull user index and ranking model from master.
 func (w *Worker) Pull() {
 	defer base.CheckPanic()
@@ -378,7 +461,6 @@ func (w *Worker) Serve() {
 		w.peers = []string{w.workerName}
 		w.me = w.workerName
 	} else {
-		go w.Sync()
 		go w.Pull()
 		go w.ServeHTTP()
 	}
@@ -398,6 +480,10 @@ func (w *Worker) Serve() {
 				zap.String("me", w.me),
 				zap.Strings("workers", w.peers))
 			return
+		}
+
+		if !w.oneMode {
+			w.Sync2()
 		}
 
 		// recommendation
